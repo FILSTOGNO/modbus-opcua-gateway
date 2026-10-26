@@ -1,0 +1,18 @@
+# Passerelle Modbus TCP -> OPC-UA (matériel réel) — dépendances Python
+# Installer avec : pip install --break-system-packages -r requirements.txt
+
+# Modbus TCP (serveur côté Pi + client côté passerelle)
+pymodbus==3.8.6
+
+# Serveur/client OPC-UA
+opcua==0.98.13
+
+# Accès au matériel du Raspberry Pi
+gpiozero
+RPi.GPIO
+pigpio
+adafruit-circuitpython-dht
+adafruit-circuitpython-ads1x15
+adafruit-blinka
+RPLCD
+smbus2

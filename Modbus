@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""
+modbus_hardware_slave.py — Serveur Modbus TCP qui lit le matériel réel.
+
+Remplace modbus_simulator.py : les valeurs ne sont plus générées
+aléatoirement, elles viennent des vrais capteurs du Raspberry Pi 4 (DHT11,
+ADS1115, PIR, HC-SR04), et les commandes écrites par un client Modbus
+(relais, servo, pas-à-pas) sont réellement appliquées au GPIO.
+
+Carte des registres : voir README.md et config.py.
+
+Usage :
+    python3 modbus_hardware_slave.py                 # matériel réel (sur le Pi)
+    python3 modbus_hardware_slave.py --simulate       # sans GPIO, pour tester
+                                                       # la chaîne Modbus/OPC-UA
+                                                       # n'importe où
+"""
+import argparse
+import logging
+import threading
+import time
+
+from pymodbus.datastore import (
+    ModbusSequentialDataBlock,
+    ModbusServerContext,
+    ModbusSlaveContext,
+)
+from pymodbus.device import ModbusDeviceIdentification
+from pymodbus.server import StartTcpServer
+
+import config
+from hardware_io import HardwareIO
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("modbus_hardware_slave")
+
+
+def build_context():
+    di = ModbusSequentialDataBlock(0, [0] * 8)
+    co = ModbusSequentialDataBlock(0, [0] * 8)
+    hr = ModbusSequentialDataBlock(0, [0] * 16)
+    ir = ModbusSequentialDataBlock(0, [0] * 16)
+    store = ModbusSlaveContext(di=di, co=co, hr=hr, ir=ir)
+    return ModbusServerContext(slaves=store, single=True)
+
+
+def sensor_loop(hw, context, stop_event):
+    """Lit les capteurs physiques en continu et met à jour les registres Modbus."""
+    last_lcd = 0.0
+    while not stop_event.is_set():
+        hw.read_all_sensors()
+        snap = hw.snapshot()
+        slave = context[0]
+
+        slave.setValues(4, config.IR_TEMPERATURE, [int(round(snap["temperature_c"] * 10)) & 0xFFFF])
+        slave.setValues(4, config.IR_HUMIDITY, [int(round(snap["humidity_pct"] * 10)) & 0xFFFF])
+        slave.setValues(4, config.IR_DISTANCE, [int(round(snap["distance_cm"] * 10)) & 0xFFFF])
+        slave.setValues(4, config.IR_MQ2_MV, [int(round(snap["mq2_voltage"] * 1000)) & 0xFFFF])
+        slave.setValues(4, config.IR_POT_MV, [int(round(snap["pot_voltage"] * 1000)) & 0xFFFF])
+        slave.setValues(2, config.DI_PIR, [1 if snap["pir_motion"] else 0])
+
+        now = time.time()
+        if now - last_lcd >= config.LCD_REFRESH_INTERVAL_S:
+            hw.refresh_lcd()   # affiche le message du scénario automatique s'il y en a un
+            last_lcd = now
+
+        time.sleep(config.SENSOR_POLL_INTERVAL_S)
+
+
+def actuator_loop(hw, context, stop_event):
+    """Surveille les registres de commande écrits par un client Modbus et pilote le GPIO."""
+    last_relais = [None] * config.N_RELAIS
+    last_servo_angle = None
+    log.info("actuator_loop démarré (surveillance des commandes relais/servo/pas-à-pas)")
+
+    while not stop_event.is_set():
+        try:
+            slave = context[0]
+
+            coils = slave.getValues(1, config.COIL_RELAIS_BASE, count=config.N_RELAIS)
+            for i, state in enumerate(coils):
+                state = bool(state)
+                if state != last_relais[i]:
+                    log.info("Changement détecté : relais %d -> %s", i + 1, state)
+                    hw.set_relais(i, state)
+                    last_relais[i] = state
+
+            servo_angle = slave.getValues(3, config.HR_SERVO_ANGLE, count=1)[0]
+            if servo_angle != last_servo_angle:
+                log.info("Changement détecté : servo -> %d°", servo_angle)
+                hw.set_servo_angle(servo_angle)
+                last_servo_angle = servo_angle
+
+            steps = slave.getValues(3, config.HR_STEPPER_STEPS, count=1)[0]
+            if steps:
+                direction = slave.getValues(3, config.HR_STEPPER_DIRECTION, count=1)[0]
+                log.info("Changement détecté : pas-à-pas -> %d pas, direction %d", steps, direction)
+                hw.run_stepper_steps(direction, steps)
+                # Registre de commande auto-remis à zéro une fois exécuté.
+                slave.setValues(3, config.HR_STEPPER_STEPS, [0])
+        except Exception:
+            log.exception("Erreur dans actuator_loop (la boucle continue)")
+
+        time.sleep(config.ACTUATOR_POLL_INTERVAL_S)
+
+
+def _sequence_pas_a_pas(hw, etat):
+    """Rotation puis pause du pas-à-pas, dans un thread à part pour ne pas bloquer
+    automation_loop pendant les ~13 secondes que dure la séquence."""
+    try:
+        log.info("Scénario : rotation du pas-à-pas pendant %.0fs", config.STEPPER_DUREE_ROTATION_S)
+        hw.run_stepper_for_duration(config.STEPPER_DIRECTION_AUTOMATIQUE, config.STEPPER_DUREE_ROTATION_S)
+        log.info("Scénario : pause de %.0fs", config.STEPPER_PAUSE_S)
+        time.sleep(config.STEPPER_PAUSE_S)
+        direction_retour = 1 - config.STEPPER_DIRECTION_AUTOMATIQUE   # sens opposé, pour revenir en arrière
+        log.info("Scénario : retour à l'état initial (rotation inverse %.0fs)", config.STEPPER_DUREE_ROTATION_S)
+        hw.run_stepper_for_duration(direction_retour, config.STEPPER_DUREE_ROTATION_S)
+        log.info("Scénario : séquence pas-à-pas terminée")
+    except Exception:
+        log.exception("Erreur dans la séquence pas-à-pas automatique")
+    finally:
+        etat["sequence_en_cours"] = False
+
+
+def automation_loop(hw, context, stop_event):
+    """Scénario autonome : réagit directement aux capteurs, sans attendre de commande
+    Modbus/OPC-UA externe.
+
+    - PIR : allume le relais "LED de présence" + affiche un message sur l'écran tant
+      qu'une présence est détectée ; les deux s'éteignent dès qu'il n'y a plus personne.
+    - HC-SR04 : quand un objet s'approche (sous le seuil), le servo part à l'angle
+      d'alerte ; quand l'objet s'éloigne, le servo revient au repos, puis — 5 secondes
+      plus tard — le pas-à-pas tourne 10 secondes, marque une pause de 3 secondes, et
+      la séquence est terminée (retour à l'état initial).
+
+    Les commandes sont écrites directement dans les registres Modbus, exactement comme
+    le ferait un client externe : actuator_loop les applique au GPIO, et la passerelle
+    les republie côté OPC-UA normalement — le scénario reste visible et cohérent avec
+    tout le reste de l'architecture.
+    """
+    log.info("automation_loop démarré (scénario PIR/HC-SR04 -> LED/écran/servo/pas-à-pas)")
+    pir_actif_precedent = False
+    approche_precedente = False
+    moment_disparition = None
+    etat_sequence = {"sequence_en_cours": False}
+
+    while not stop_event.is_set():
+        try:
+            snap = hw.snapshot()
+            slave = context[0]
+
+            # --- PIR : LED + message écran tant qu'une présence est détectée ---
+            pir_actif = snap["pir_motion"]
+            if pir_actif and not pir_actif_precedent:
+                log.info("Scénario : présence détectée -> LED ON + message écran")
+                slave.setValues(1, config.COIL_RELAIS_BASE + config.AUTOMATION_LED_RELAIS_INDEX, [1])
+                hw.set_lcd_message("PRESENCE !")
+            elif not pir_actif and pir_actif_precedent:
+                log.info("Scénario : plus de présence -> LED OFF")
+                slave.setValues(1, config.COIL_RELAIS_BASE + config.AUTOMATION_LED_RELAIS_INDEX, [0])
+                hw.clear_lcd_message()
+            pir_actif_precedent = pir_actif
+
+            # --- HC-SR04 : servo + séquence pas-à-pas différée ---
+            approche = snap["distance_cm"] < config.HCSR04_SEUIL_APPROCHE_CM
+            if approche and not approche_precedente:
+                log.info("Scénario : objet à %.1fcm -> servo %d°", snap["distance_cm"], config.SERVO_ANGLE_ALERTE)
+                slave.setValues(3, config.HR_SERVO_ANGLE, [config.SERVO_ANGLE_ALERTE])
+                moment_disparition = None
+            elif not approche and approche_precedente:
+                log.info("Scénario : objet disparu -> servo retour %d°", config.SERVO_ANGLE_REPOS)
+                slave.setValues(3, config.HR_SERVO_ANGLE, [config.SERVO_ANGLE_REPOS])
+                moment_disparition = time.time()
+            approche_precedente = approche
+
+            if (
+                moment_disparition is not None
+                and not etat_sequence["sequence_en_cours"]
+                and time.time() - moment_disparition >= config.STEPPER_DELAI_APRES_DISPARITION_S
+            ):
+                moment_disparition = None
+                etat_sequence["sequence_en_cours"] = True
+                threading.Thread(target=_sequence_pas_a_pas, args=(hw, etat_sequence), daemon=True).start()
+
+        except Exception:
+            log.exception("Erreur dans automation_loop (la boucle continue)")
+
+        time.sleep(config.AUTOMATION_POLL_INTERVAL_S)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Serveur Modbus TCP — capteurs/actionneurs réels du Pi 4")
+    parser.add_argument(
+        "--simulate",
+        action="store_true",
+        help="N'utilise aucun GPIO/I2C réel (pour tester la chaîne Modbus/OPC-UA hors du Pi)",
+    )
+    args = parser.parse_args()
+
+    log.info("Initialisation du matériel%s...", " (simulation)" if args.simulate else "")
+    hw = HardwareIO(simulate=args.simulate)
+    context = build_context()
+
+    identity = ModbusDeviceIdentification()
+    identity.VendorName = "Passerelle Angelbert"
+    identity.ProductCode = "PI4-MODBUS-HW"
+    identity.ProductName = "Passerelle Modbus TCP -> OPC-UA (matériel réel)"
+    identity.ModelName = "Raspberry Pi 4"
+
+    stop_event = threading.Event()
+    threading.Thread(target=sensor_loop, args=(hw, context, stop_event), daemon=True).start()
+    threading.Thread(target=actuator_loop, args=(hw, context, stop_event), daemon=True).start()
+    threading.Thread(target=automation_loop, args=(hw, context, stop_event), daemon=True).start()
+
+    log.info("Serveur Modbus TCP démarré sur %s:%s", config.MODBUS_HOST, config.MODBUS_PORT)
+    try:
+        StartTcpServer(context=context, identity=identity, address=(config.MODBUS_HOST, config.MODBUS_PORT))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+        hw.close()
+
+
+if __name__ == "__main__":
+    main()
